@@ -1,7 +1,8 @@
 """ Generic configuration.
 
 A Config object has a set of options, which can be str, int, float,
-bool, or list. These options can be configured from different sources:
+bool, or a tuple of any of the above. These options can be configured
+from different sources:
 
 * Each option has a default value
 * From a set of common ``.cfg`` files, and additional filenames given
@@ -55,21 +56,32 @@ def as_bool(value):
     else:
         raise ValueError('Cannot make a bool of %r' % value)
 
+def get_tuple_validator(subvalidator):
+    def validator(value):
+        if isinstance(value, (tuple, list)):
+            value2 = tuple(value)
+        elif isinstance(value, str):
+            value2 = tuple([s.strip() for s in value.split(',')])
+        else:
+            raise ValueError('Cannot make a tuple of %r' % value)
+        return tuple([subvalidator(x) for x in value2])
+    return validator
+
+
+TYPEMAP = {float:float, int:int, bool:as_bool}
+
 if sys.version_info[0] == 2:
     import ConfigParser as configparser
-    TYPEMAP = {basestring:unicode, float:float, int:int, bool:as_bool}
+    TYPEMAP[basestring] = unicode
 else:
     import configparser
-    TYPEMAP = {str:str, float:float, int:int, bool:as_bool}
-
-def is_valid_name(n):
-    return isinstance(n, str) and n.isidentifier() and not n.startswith('_')
+    TYPEMAP[str] = str
 
 
 INSTANCE_DOCS = """ Configuration object for {name}
     
     The options below can be set via a ``.cfg`` file, environment variable,
-    command-line argument, or directly in Python.
+    command-line argument, or by modifying the config object in Python.
     
     Parameters:
     """
@@ -84,18 +96,21 @@ class Config:
             line arguments, and as a section header in .cfg files.
         *sources: Additional sources to initialize the option values with.
             These can be strings in .cfg format, or filenames of .cfg files.
+            If a file is given that does not exist, it is simpli ignored.
         **options: The options specification: each option consists of
             a 3-element tuple (default, type, docstring).
     
-    The options can be of the following types, str, bool, int, float.
-    Values (also default values) can be specified as a Python object
-    or a string; they are automatically converted to a Python object.
+    The options can be of the following types: str, bool, int, float,
+    and a tuple with one of the previous types. Values (also default
+    values) can be specified as a Python object or a string; they are
+    automatically converted to a Python object.
     
     Example:
     
         config = Config('myconfig', 
                         foo=(False, bool, 'Whether to foo'),
-                        bar=(0.0, float, 'The size of the bar'))
+                        bar=(0.0, float, 'The size of the bar'),
+                        spam=('1,2,3', [int], 'A tuple of ints'))
         
         config.bar = 3  # Attribute access (values are converted)
         print(config['FOO'])  # Case insensitive
@@ -121,11 +136,16 @@ class Config:
         # Map of option names to validator functions, lowercase keys
         self._opt_validators = {}
         
+        # Map of option names to type names, for better reporting
+        self._opt_typenames = {}
+        
         # Parse options
         if not isinstance(options, dict):
             raise TypeError('Config needs dict argument for the options.')
         option_docs = ['']
-        for name, spec in options.items():
+        for name in sorted(options.keys(), key=lambda x: x.lower()):
+            lname = name.lower()
+            spec = options[name]
             # Checks
             if not is_valid_name(name):
                 raise ValueError('Option name must be alphanumeric strings, '
@@ -133,14 +153,22 @@ class Config:
             if not len(spec) == 3:
                 raise ValueError('Option spec must be (default, type, docs)')
             default, typ, doc = spec
+            istuple = False
+            if isinstance(typ, (tuple, list)):
+                if len(typ) != 1:
+                    raise ValueError('Tuple type spec should have one element.')
+                istuple, typ = True, typ[0]
             if not (isinstance(typ, type) and issubclass(typ, tuple(TYPEMAP))):
                 raise ValueError('Option types can be str, bool, int, float.')
             # Parse
-            args = name, typ, doc, default
+            typename = typ.__name__ + ('-tuple' if istuple else '')
+            args = name, typename, doc, default
             option_docs.append(' '*8 + '%s (%s): %s (default %r)' % args)
             self._options.append(name)
-            self._opt_validators[name.lower()] = TYPEMAP[typ]
-            self._opt_values[name.lower()] = []
+            self._opt_typenames[name] = typename
+            self._opt_validators[lname] = (get_tuple_validator(TYPEMAP[typ])
+                                           if istuple else TYPEMAP[typ])
+            self._opt_values[lname] = []
         
         # Overwrite docstring
         self.__doc__ = INSTANCE_DOCS.format(name=self._name)
@@ -202,6 +230,9 @@ class Config:
         t = '<Config %r with %i options at 0x%x>'
         return t % (self._name, len(self._options), id(self))
     
+    def __len__(self):
+        return len(self._options)
+    
     def __iter__(self):
         return self._options.__iter__()
     
@@ -241,7 +272,11 @@ class Config:
     def _set(self, source, name, value):
         # The actual setter (case insensitive), applies the validator
         validator = self._opt_validators[name.lower()]
-        real_value = validator(value)
+        try:
+            real_value = validator(value)
+        except Exception:
+            args = name, self._opt_typenames[name], value
+            raise ValueError('Cannot set option %s (%s) from %r' % args)
         s = self._opt_values[name.lower()]
         if s and s[-1][0] == source:
             s[-1] = source, real_value
@@ -257,6 +292,10 @@ class Config:
                 if parser.has_option(self._name, name):
                     value = parser.get(self._name, name)
                     self._set(filename, name, value)
+
+
+def is_valid_name(n):
+    return isinstance(n, str) and n.isidentifier() and not n.startswith('_')
 
 
 # From pyzolib/paths.py (https://bitbucket.org/pyzo/pyzolib/src/tip/paths.py)
